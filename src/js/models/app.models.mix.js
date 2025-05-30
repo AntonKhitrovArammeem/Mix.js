@@ -1,47 +1,62 @@
-App.module('Models', function( Models, App, Backbone, Marionette, $, _ ) {
+/* global console */
+App.module('Models', function(Models, App, Backbone, Marionette, $, _) {
 
   'use strict';
 
   var Mix = Models.Mix = Backbone.Model.extend({
 
-    url: 'mix.json',
+    url: function() {
+      // Legacy-compatible query string parser
+      function getQueryParam(name) {
+        var pattern = new RegExp('[?&]' + name + '=([^&]*)');
+        var match = pattern.exec(window.location.search);
+        return match && decodeURIComponent(match[1].replace(/\+/g, ' '));
+      }
+
+      var taskId = getQueryParam('taskId') || 10;
+      var fileIndex = getQueryParam('fileIndex') || 0;
+
+      if (taskId) {
+        return (
+          '/api/mixjsgen/' +
+          encodeURIComponent(taskId) +
+          '/' +
+          encodeURIComponent(fileIndex)
+        );
+      } else {
+        return 'mix.json';
+      }
+    },
 
     defaults: {
-      // mix name
-      name      : 'Mix',
-      // master gain (0 - 1)
-      gain      : 1,
-      // playback position (in seconds)
-      position  : 0,
-      // minimum allowed playback position
-      minTime   : 0,
-      // maximum allowed playback position
-      maxTime   : Infinity,
-      // internal value for playback scheduling
-      startTime : 0,
-      // are we currently playing?
-      playing   : false,
-      // internal value for VU meters
-      dBFSLeft   : -48,
-      // internal value for VU meters
-      dBFSRight  : -48,
-      // internally calculated song duration
-      duration  : Infinity
+      name: 'Mix',
+      gain: 1,
+      position: 0,
+      minTime: 0,
+      maxTime: Infinity,
+      startTime: 0,
+      playing: false,
+      dBFSLeft: -48,
+      dBFSRight: -48,
+      duration: Infinity
     },
 
     initialize: function() {
       this.nodes = {};
       this.createNodes();
       this.setGain();
-      this.updatePosition();
-      App.vent.on('solo', this.soloMute.bind(this));
-      App.vent.on('unsolo', this.soloMute.bind(this));
-      App.vent.on('anim-tick', this.updatePosition.bind(this));
+      if (typeof this.updatePosition === 'function') {
+        this.updatePosition();
+      }
+      if (App && App.vent && typeof App.vent.on === 'function') {
+        App.vent.on('solo', this.soloMute.bind(this));
+        App.vent.on('unsolo', this.soloMute.bind(this));
+        App.vent.on('anim-tick', this.updatePosition.bind(this));
+      }
       this.on('change:gain', this.setGain, this);
       this.on('change:gain', this.persist, this);
     },
 
-    // create audio nodes
     createNodes: function() {
       this.fftSize = 2048;
       this.timeDataL = new Uint8Array(this.fftSize);
@@ -59,30 +74,91 @@ App.module('Models', function( Models, App, Backbone, Marionette, $, _ ) {
       return this;
     },
 
-    // set gain
     setGain: function() {
       this.nodes.gain.gain.value = this.get('gain');
       return this;
     },
 
-    // begin playback of all tracks
-    // optionally accepts a playback position in seconds
-    play: function( pos ) {
-      var now = App.ac.currentTime,
-        time = this.get('position'),
-        max = this.get('tracks').maxLength();
-      if ( !App.ready ) {
-        throw new Error('Cannot play before App.ready');
+    play: function(pos) {
+      var now = App.ac.currentTime;
+      var time = this.get('position');
+      var tracks = this.get('tracks').models;
+      var soloed = [];
+      for (var i = 0; i < tracks.length; i++) {
+        if (tracks[i].get('soloed')) {
+          soloed.push(tracks[i]);
+        }
       }
-      if ( typeof pos === 'number' ) {
+      var hasSolo = soloed.length > 0;
+      var duration = 0;
+      for (var j = 0; j < tracks.length; j++) {
+        var t = tracks[j];
+        if (t.buffer && t.buffer.duration > duration) {
+          duration = t.buffer.duration;
+        }
+      }
+
+      if (typeof pos === 'number') {
         this.set('position', time = Math.max(pos, this.get('minTime')));
       }
-      this.set({startTime: now - time, playing: true, duration: max});
+
+      this.set({ startTime: now - time, playing: true, duration: duration });
       this.get('tracks').play(time);
+
+      var sampleRate = App.ac.sampleRate;
+      var length = Math.ceil(duration * sampleRate);
+      var AudioCtx = window.OfflineAudioContext ||
+        window.webkitOfflineAudioContext;
+      var offlineCtx = new AudioCtx(2, length, sampleRate);
+
+      for (var k = 0; k < tracks.length; k++) {
+        var track = tracks[k];
+        var muted = track.get('muted');
+        var solo = track.get('soloed');
+        var gainVal = track.get('gain') || 1.0;
+        var panVal = track.get('pan') || 0.0;
+        var buffer = track.buffer;
+
+        var shouldPlay = buffer && !muted && (!hasSolo || solo);
+        if (!shouldPlay) {
+          continue;
+        }
+
+        var src = offlineCtx.createBufferSource();
+        src.buffer = buffer;
+
+        var gain = offlineCtx.createGain();
+        gain.gain.value = gainVal;
+
+        var pan = offlineCtx.createStereoPanner();
+        pan.pan.value = panVal;
+
+        src.connect(gain).connect(pan).connect(offlineCtx.destination);
+        src.start(0);
+      }
+
+      offlineCtx.startRendering().then(function(buffer) {
+        var wav = this._audioBufferToWav(buffer);
+        var blob = new Blob([wav], { type: 'audio/wav' });
+        var url = URL.createObjectURL(blob);
+
+        var a = document.getElementById('mix-download');
+        if (!a) {
+          a = document.createElement('a');
+          a.id = 'mix-download';
+          a.textContent = 'Download Mixdown';
+          a.style.display = 'block';
+          document.body.appendChild(a);
+        }
+        a.href = url;
+        a.download = (this.get('name') || 'mix') + '.wav';
+      }.bind(this))['catch'](function(err) {
+        console.error('Mixdown error:', err);
+      });
+
       return this;
     },
 
-    // pause all tracks
     pause: function() {
       this.get('tracks').pause();
       this.set('playing', false);
@@ -90,64 +166,57 @@ App.module('Models', function( Models, App, Backbone, Marionette, $, _ ) {
       return this;
     },
 
-    // get the exact, up-to-date playback position
-    exactTime: function(){
-      var now = App.ac.currentTime,
-        playing = this.get('playing'),
-        start = this.get('startTime'),
-        position = this.get('position'),
-        delta = now - start;
+    exactTime: function() {
+      var now = App.ac.currentTime;
+      var playing = this.get('playing');
+      var start = this.get('startTime');
+      var position = this.get('position');
+      var delta = now - start;
       return playing ? delta : position;
     },
 
-    // periodically update the position attribute (for UI)
-    updatePosition: function(){
-      var position = this.exactTime(),
-        playing = this.get('playing');
-      if ( position > Math.min(this.get('maxTime'), this.get('duration')) ) {
+    updatePosition: function() {
+      var position = this.exactTime();
+      var playing = this.get('playing');
+      if (position > Math.min(this.get('maxTime'), this.get('duration'))) {
         this.play(0).pause();
       } else {
-        this.set('position', position, {silent: true});
+        this.set('position', position, { silent: true });
       }
       return this;
     },
 
-    // selectively apply/remove mutes depending on which tracks
-    // are soloed and unsoloed
     soloMute: function() {
       var unsoloed, soloed, _muted;
-      if ( this.get('tracks') ) {
-        unsoloed = this.get('tracks').where({soloed: false});
-        soloed = this.get('tracks').where({soloed: true});
-        _muted = this.get('tracks').where({_muted: true});
-        // apply _mute to non-soloed tracks
-        if ( soloed.length ){
-          unsoloed.forEach(function( track ){
-            track._mute();
-          });
+      if (this.get('tracks')) {
+        unsoloed = this.get('tracks').where({ soloed: false });
+        soloed = this.get('tracks').where({ soloed: true });
+        _muted = this.get('tracks').where({ _muted: true });
+        if (soloed.length) {
+          for (var i = 0; i < unsoloed.length; i++) {
+            unsoloed[i]._mute();
+          }
         }
-        // remove _mute when nothing is soloed
-        if ( !soloed.length ) {
-          _muted.forEach(function( track ) {
-            track._unmute();
-          });
+        if (!soloed.length) {
+          for (var j = 0; j < _muted.length; j++) {
+            _muted[j]._unmute();
+          }
         }
       }
       return this;
     },
 
-    // get dBFS values
-    levels: function( e ) {
-      var playing = this.get('playing'),
-        len = this.timeDataL.length,
-        right = new Array(len),
-        left = new Array(len),
-        i = 0;
+    levels: function() {
+      var playing = this.get('playing');
+      var len = this.timeDataL.length;
+      var right = new Array(len);
+      var left = new Array(len);
+      var i = 0;
       this.nodes.analyserL.getByteTimeDomainData(this.timeDataL);
       this.nodes.analyserR.getByteTimeDomainData(this.timeDataR);
-      for ( ; i < len; ++i ) {
-        left[i] = ( this.timeDataL[i] * 2 / 255 ) - 1;
-        right[i] = ( this.timeDataR[i] * 2 / 255 ) - 1;
+      for (; i < len; ++i) {
+        left[i] = (this.timeDataL[i] * 2 / 255) - 1;
+        right[i] = (this.timeDataR[i] * 2 / 255) - 1;
       }
       left = App.util.dBFS(left);
       right = App.util.dBFS(right);
@@ -158,8 +227,7 @@ App.module('Models', function( Models, App, Backbone, Marionette, $, _ ) {
       return this;
     },
 
-    // override default parsing to create `tracks` collection
-    parse: function( data ) {
+    parse: function(data) {
       data.tracks = new App.Collections.Tracks(data.tracks);
       data.position = data.position || data.minTime || 0;
       App.tracks = data.tracks.length;
@@ -167,10 +235,10 @@ App.module('Models', function( Models, App, Backbone, Marionette, $, _ ) {
     },
 
     toJSON: function() {
-      var out = _.extend({}, this.attributes),
-        tracks = _.map(this.get('tracks').models, function( track ) {
-          return track.toJSON();
-        });
+      var out = _.extend({}, this.attributes);
+      var tracks = _.map(this.get('tracks').models, function(track) {
+        return track.toJSON();
+      });
       out.tracks = tracks;
       delete out.dBFSLeft;
       delete out.dBFSRight;
@@ -180,9 +248,9 @@ App.module('Models', function( Models, App, Backbone, Marionette, $, _ ) {
     },
 
     persist: _.debounce(function() {
-      var self = App.mix,
-        data = self.toJSON(),
-        binURI = self.get('binURI');
+      var self = App.mix;
+      var data = self.toJSON();
+      var binURI = self.get('binURI');
       delete data.position;
       delete data.playing;
       delete data.duration;
@@ -194,14 +262,72 @@ App.module('Models', function( Models, App, Backbone, Marionette, $, _ ) {
         contentType: 'application/json; charset=utf-8',
         dataType: 'json',
         data: data,
-        success: function( response ) {
-          if ( response.uri ) {
-            self.set('binURI', response.uri, {silent: true});
+        success: function(response) {
+          if (response.uri) {
+            self.set('binURI', response.uri, { silent: true });
             location.hash = response.uri.split('/').pop();
           }
         }
       });
-    }, 500)
+    }, 500),
+
+    _audioBufferToWav: function(buffer) {
+      var numChannels = buffer.numberOfChannels;
+      var sampleRate = buffer.sampleRate;
+      var format = 1;
+      var bitDepth = 16;
+
+      var interleaved = this._interleave(
+        buffer.getChannelData(0),
+        numChannels > 1 ? buffer.getChannelData(1) : buffer.getChannelData(0)
+      );
+
+      var bufferLength = 44 + interleaved.length * 2;
+      var output = new ArrayBuffer(bufferLength);
+      var view = new DataView(output);
+
+      function writeString(view, offset, str) {
+        for (var i = 0; i < str.length; i++) {
+          view.setUint8(offset + i, str.charCodeAt(i));
+        }
+      }
+
+      function floatTo16BitPCM(view, offset, input) {
+        for (var i = 0; i < input.length; i++, offset += 2) {
+          var s = Math.max(-1, Math.min(1, input[i]));
+          view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        }
+      }
+
+      writeString(view, 0, 'RIFF');
+      view.setUint32(4, 36 + interleaved.length * 2, true);
+      writeString(view, 8, 'WAVE');
+      writeString(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, format, true);
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * numChannels * bitDepth / 8, true);
+      view.setUint16(32, numChannels * bitDepth / 8, true);
+      view.setUint16(34, bitDepth, true);
+      writeString(view, 36, 'data');
+      view.setUint32(40, interleaved.length * 2, true);
+
+      floatTo16BitPCM(view, 44, interleaved);
+
+      return output;
+    },
+
+    _interleave: function(inputL, inputR) {
+      var length = inputL.length + inputR.length;
+      var result = new Float32Array(length);
+      var index = 0;
+      for (var i = 0; i < inputL.length; i++) {
+        result[index++] = inputL[i];
+        result[index++] = inputR[i];
+      }
+      return result;
+    }
 
   });
 
