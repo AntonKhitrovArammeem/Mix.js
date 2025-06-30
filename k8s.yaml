@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dawai-mixjs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dawai-mixjs
+  template:
+    metadata:
+      labels:
+        app: dawai-mixjs
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: dawai-web
+                    operator: In
+                    values:
+                      - "true"
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        volumeMounts:
+        - name: mixjs-volume
+          mountPath: /usr/share/nginx/html
+      volumes:
+      - name: mixjs-volume
+        hostPath:
+          path: /mnt/md0/dev/Mix.js/public
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dawai-mixjs
+spec:
+  type: NodePort
+  selector:
+    app: dawai-mixjs
+  ports:
+    - port: 8083
+      targetPort: 80
+      nodePort: 30884

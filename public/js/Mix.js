@@ -19712,15 +19712,12 @@
           return match && decodeURIComponent(match[1].replace(/\+/g, ' '));
         }
   
-        var taskId = getQueryParam('taskId') || 10;
-        var fileIndex = getQueryParam('fileIndex') || 0;
+        var workspaceId = getQueryParam('workspaceId') || 10;
   
-        if (taskId) {
+        if (workspaceId) {
           return (
             '/api/mixjsgen/' +
-            encodeURIComponent(taskId) +
-            '/' +
-            encodeURIComponent(fileIndex)
+            encodeURIComponent(workspaceId)
           );
         } else {
           return 'mix.json';
