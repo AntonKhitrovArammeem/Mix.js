@@ -9,6 +9,12 @@ spec:
       app: dawai-mixjs
   template:
     metadata:
+      annotations:
+        ad.datadoghq.com/dawai-mixjs.logs: >-
+          [{
+            "source": "nginx",
+            "service": "dawai-mixjs"
+          }]
       labels:
         app: dawai-mixjs
     spec:
